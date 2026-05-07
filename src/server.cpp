@@ -6,6 +6,8 @@
 #include <poll.h>       // The multiplexing engine
 #include "OrderBook.hpp"
 #include "Protocol.hpp"
+#include "DatabaseManager.hpp" // For async DB logging
+#include "AccountManager.hpp"  // For async DB logging
 
 #define SOCKET_PATH "/tmp/engine.sock" // Address of server in local PC
 #define BUFFER_SIZE 1024               // Max size of a single message
@@ -43,6 +45,10 @@ int main()
     // Print message to show server has started
     std::cout << "[SERVER] Order Engine started at " << SOCKET_PATH << std::endl;
 
+    DatabaseManager dbMgr("lob.db");
+    AccountManager accountMgr(dbMgr);
+    std::unordered_map<int, int> fdToUserId;
+
     // Main loop
     while (true)
     {
@@ -72,65 +78,77 @@ int main()
                 // Case B: Event on client socket (existing connection)
                 else
                 {
-                    // A client sent an order
-                    // int bytes_read = read(fds[i].fd, buffer, sizeof(buffer) - 1);
+                    char header_buf[1];
+                    int peek_ret = recv(fds[i].fd, header_buf, 1, MSG_PEEK);
+                    if (peek_ret == 0)
+                    { // Client disconnected
+                        std::cout << "[SERVER] Client disconnected." << std::endl;
+                        close(fds[i].fd);
+                        fds.erase(fds.begin() + i);
+                        --i;
+                        continue;
+                    }
 
-                    // if (bytes_read <= 0) {
-                    //     // If disconnected or error, close socket and remove
-                    //     close(fds[i].fd);
-                    //     fds.erase(fds.begin() + i);
-                    //     std::cout << "[SERVER] Client disconnected." << std::endl;
-                    // } else {
-                    //     // Parse the data heree
-                    //     buffer[bytes_read] = '\0';
-                    //     std::string msg(buffer);
-                    //     std::cout << "[SERVER] Received: " << msg << std::endl;
+                    MsgType type = static_cast<MsgType>(header_buf[0]);
 
-                    //     // TODO: Parse msg (e.g., "BUY|AAPL|150.0|10")
-                    //     // and call engine.matchOrder(...)
-                    // }
+                    if (type == MsgType::LOGIN_REQ)
+                    {
+                        char login_buf[sizeof(MsgHeader) + sizeof(LoginRequest)];
+                        read(fds[i].fd, login_buf, sizeof(login_buf));
 
-                    int bytes_read = read(fds[i].fd, buffer, sizeof(buffer));
+                        LoginRequest *req = reinterpret_cast<LoginRequest *>(login_buf + sizeof(MsgHeader));
+                        int uid = accountMgr.authenticate(req->username, req->password);
 
-                    if (bytes_read >= sizeof(OrderMsg)) {
-                        // 1. Zero-copy cast
-                        OrderMsg* msg = reinterpret_cast<OrderMsg*>(buffer);
+                        LoginResponse res = {(uid != -1), uid};
+                        send(fds[i].fd, &res, sizeof(LoginResponse), 0);
 
-                        // 2. Extract Client ID
-                        std::string clientID(msg->clOrdId, 16);
-                        
-                        // 3. Generate the Exchange ID (The "Truth")
-                        uint64_t exID = engine.generateExchangeId();
+                        if (uid != -1)
+                            fdToUserId[fds[i].fd] = uid;
+                    }
+                    else if (type == MsgType::ORDER_NEW)
+                    {
+                        if (fdToUserId.find(fds[i].fd) == fdToUserId.end())
+                        {
+                            std::cout << "[WARN] Unauthenticated order attempt!" << std::endl;
+                            // Drain the invalid message so it doesn't stay in the buffer
+                            char garbage[sizeof(MsgHeader) + sizeof(OrderMsg)];
+                            read(fds[i].fd, garbage, sizeof(garbage));
+                            continue;
+                        }
 
-                        std::cout << "[BOOK] Assigning ID " << exID << " to Client ID " << clientID << std::endl;
+                        // FIX: Read the Header AND the Order together to handle the offset
+                        char order_buf[sizeof(MsgHeader) + sizeof(OrderMsg)];
+                        int bytes_read = read(fds[i].fd, order_buf, sizeof(order_buf));
 
-                        // 4. Create internal Order object
-                        Order incoming = {
-                            clientID, 
-                            exID, 
-                            msg->price, 
-                            msg->qty, 
-                            (msg->side == 'B' ? Side::BUY : Side::SELL)
-                        };
+                        if (bytes_read >= sizeof(order_buf))
+                        {
+                            // Cast starting AFTER the header
+                            OrderMsg *msg = reinterpret_cast<OrderMsg *>(order_buf + sizeof(MsgHeader));
 
-                        // 5. Match and Process
-                        engine.matchOrder(incoming);
-                        std::cout << "TOP OF BOOK: " << "Best Bid = " << engine.getBestBid() << ", Best Ask = " << engine.getBestAsk() << std::endl;
+                            std::string clientID(msg->clOrdId, 16);
+                            uint64_t exID = engine.generateExchangeId();
 
-                        // 6. OPTIONAL: Send Acknowledgement back to Client
-                        OrderResponse res;
-                        memcpy(res.clOrdId, msg->clOrdId, 16);
-                        res.exchangeId = exID;
-                        res.status = 'A';
-                        
-                        send(fds[i].fd, &res, sizeof(OrderResponse), 0);
-                        std::cout << "[SERVER] Sent ACK for Client ID " << clientID << " with Exchange ID " << exID << std::endl;
+                            Order incoming = {
+                                clientID,
+                                exID,
+                                msg->price,
+                                msg->qty,
+                                (msg->side == 'B' ? Side::BUY : Side::SELL)};
+
+                            engine.matchOrder(incoming);
+
+                            // ... Send ACK ...
+                            OrderResponse res;
+                            memcpy(res.clOrdId, msg->clOrdId, 16);
+                            res.exchangeId = exID;
+                            res.status = 'A';
+                            send(fds[i].fd, &res, sizeof(OrderResponse), 0);
+                        }
                     }
                 }
             }
         }
     }
-
     close(server_fd);
     unlink(SOCKET_PATH);
     return 0;

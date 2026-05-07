@@ -18,3 +18,8 @@ Defining Schema
 
 - Create schema.sql
 - Run "sqlite3 lob.db < schema.sql" to initiate
+- Check schemas:
+    - Run "sqlite3 lob.db"
+    - .tables
+    - .schema Orders
+    - .quit
