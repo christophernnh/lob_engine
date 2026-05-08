@@ -2,6 +2,7 @@
 #include <map>
 #include <list>
 #include "Order.hpp"
+#include "Protocol.hpp"
 
 class OrderBook
 {
@@ -10,19 +11,17 @@ private:
 
     std::map<double, std::list<Order>, std::greater<double>> bids;
     std::map<double, std::list<Order>> asks;
-    std::unordered_map<std::string, std::list<Order>::iterator> orderMap;
+    std::unordered_map<uint64_t, std::list<Order>::iterator> orderMap;
 
     template <typename T>
-    void executeMatch(Order &incomingOrder, T &targetBook);
+    void executeMatch(Order &incomingOrder, T &targetBook, std::vector<Trade> &trades);
 
 public:
     void processOrder(const Order &order);
-    void cancelOrder(const std::string &orderId);
+    void cancelOrder(uint64_t orderId);
 
-    double getBestBid();
-    double getBestAsk();
-    double getOrderPrice(std::string orderId);
+    MarketDataSnapshot getL2Snapshot();
 
-    void matchOrder(Order &incomingOrder);
+    MatchResult matchOrder(Order &incomingOrder);
     uint64_t generateExchangeId();
 };

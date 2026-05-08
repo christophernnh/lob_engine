@@ -26,3 +26,15 @@ CREATE TABLE IF NOT EXISTS Orders (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES Users(user_id)
 );
+
+-- Trades Table
+CREATE TABLE IF NOT EXISTS Trades (
+    trade_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    maker_order_id TEXT NOT NULL, -- The order that was already on the book
+    taker_order_id TEXT NOT NULL, -- The order that just arrived and matched
+    price REAL NOT NULL,
+    qty INTEGER NOT NULL,
+    executed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (maker_order_id) REFERENCES Orders(exchange_id),
+    FOREIGN KEY (taker_order_id) REFERENCES Orders(exchange_id)
+);

@@ -10,19 +10,25 @@
 enum class DBTaskType
 {
     INSERT_ORDER,
+    INSERT_TRADE,
     UPDATE_HOLDING,
-    UPDATE_STATUS
+    UPDATE_ORDER_STATUS
 };
 
 struct DBTask
 {
     DBTaskType type;
+    // For Orders
     std::string exchangeId;
     int userId;
     double price;
     int qty;
     std::string side;
     std::string status;
+    // For Trades
+    std::string takerId;
+    std::string makerId;
+    int remainingQty;
 };
 
 struct AuthData
@@ -44,6 +50,8 @@ private:
     // Prepared Statements (The Gold Standard for performance/security)
     sqlite3_stmt *insertOrderStmt;
     sqlite3_stmt *updateHoldingStmt;
+    sqlite3_stmt *insertTradeStmt;
+    sqlite3_stmt *updateOrderStmt;
 
     void run(); // Background worker loop
 
@@ -52,5 +60,7 @@ public:
     ~DatabaseManager();
     AuthData getUserAuthData(const std::string &username);
 
-    void enqueueOrder(const std::string &exId, int userId, double price, int qty, std::string side);
+    void enqueueOrder(uint64_t exId, int userId, double price, int qty, std::string side, std::string status);
+    void enqueueTrade(uint64_t takerId, uint64_t makerId, double price, int qty);
+    void updateOrderStatus(uint64_t exId, int remainingQty, std::string status);
 };

@@ -23,3 +23,4 @@ Defining Schema
     - .tables
     - .schema Orders
     - .quit
+- Truncate tables: sqlite3 lob.db "DELETE FROM Users; DELETE FROM Holdings; DELETE FROM Orders; DELETE FROM Trades; DELETE FROM sqlite_sequence WHERE name IN ('Users', 'Orders', 'Trades'); VACUUM;"

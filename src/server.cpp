@@ -8,6 +8,7 @@
 #include "Protocol.hpp"
 #include "DatabaseManager.hpp" // For async DB logging
 #include "AccountManager.hpp"  // For async DB logging
+#include "NetworkUtils.hpp"   // For snapshot sending helpers
 
 #define SOCKET_PATH "/tmp/engine.sock" // Address of server in local PC
 #define BUFFER_SIZE 1024               // Max size of a single message
@@ -104,6 +105,7 @@ int main()
 
                         if (uid != -1)
                             fdToUserId[fds[i].fd] = uid;
+                            NetworkUtils::broadcastSnapshot(fds, server_fd, engine);
                     }
                     else if (type == MsgType::ORDER_NEW)
                     {
@@ -135,7 +137,37 @@ int main()
                                 msg->qty,
                                 (msg->side == 'B' ? Side::BUY : Side::SELL)};
 
-                            engine.matchOrder(incoming);
+                            MatchResult result = engine.matchOrder(incoming);
+                            
+                            NetworkUtils::broadcastSnapshot(fds, server_fd, engine);
+
+                            // MarketDataSnapshot snapshot = engine.getL2Snapshot();
+                            // for (size_t j = 0; j < fds.size(); ++j) {
+                            //     if (fds[j].fd != server_fd) { // Don't send to the listening socket
+                            //         int sent_bytes = send(fds[j].fd, &snapshot, sizeof(snapshot), 0);
+                            //         if (sent_bytes < 0) {
+                            //             perror("Send failed");
+                            //         }
+                            //     }
+                            // }
+
+                            // Async DB logging
+                            std::string status = result.isFullyFilled ? "FILLED" : (result.trades.empty() ? "OPEN" : "PARTIAL");
+                            dbMgr.enqueueOrder(incoming.exchangeId, fdToUserId[fds[i].fd], incoming.price, incoming.qty, incoming.side == Side::BUY ? "BUY" : "SELL", status);
+
+                            for (const auto &t : result.trades)
+                            {
+                                dbMgr.enqueueTrade(t.makerId, t.takerId, t.price, t.qty);
+                                // 2. Update the Maker's state in the DB
+                                std::string makerStatus = (t.makerRemainingQty == 0) ? "FILLED" : "PARTIAL";
+                                dbMgr.updateOrderStatus(t.makerId, t.makerRemainingQty, makerStatus);
+                            }
+
+                            // --- Engine FEEDBACK ---
+                            if (result.wasAddedToBook)
+                            {
+                                std::cout << "[INFO] Order " << incoming.exchangeId << " is now resting on the book." << std::endl;
+                            }
 
                             // ... Send ACK ...
                             OrderResponse res;
@@ -144,6 +176,20 @@ int main()
                             res.status = 'A';
                             send(fds[i].fd, &res, sizeof(OrderResponse), 0);
                         }
+                    }
+                    else if (type == MsgType::ORDER_CANCEL)
+                    {
+                        CancelRequest req;
+                        read(fds[i].fd, &req, sizeof(CancelRequest));
+
+                        // TODO: Safety check: Does this user own this order?
+                        // if (fdToUserId[fds[i].fd] != accountMgr.getUserIdByOrderId(req.exchangeId)) {
+                        //     std::cout << "[WARN] User " << fdToUserId[fds[i].fd] << " attempted to cancel order " << req.exchangeId << " which they do not own!" << std::endl;
+                        //     continue;
+                        // }
+
+                        engine.cancelOrder(req.exchangeId);
+                        dbMgr.updateOrderStatus(req.exchangeId, 0, "CANCELLED");
                     }
                 }
             }
