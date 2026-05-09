@@ -7,7 +7,7 @@ namespace NetworkUtils
     void sendSnapshotToClient(int client_fd, OrderBook &engine)
     {
         MarketDataSnapshot snap = engine.getL2Snapshot();
-        snap.header.type = MsgType::MARKET_DATA; // CRITICAL: Set the type!
+        snap.header.type = MsgType::MARKET_DATA;
         send(client_fd, &snap, sizeof(snap), 0);
     }
 

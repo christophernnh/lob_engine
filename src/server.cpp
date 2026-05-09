@@ -203,12 +203,6 @@ int main()
                         CancelRequest req;
                         read(fds[i].fd, &req, sizeof(CancelRequest));
 
-                        // TODO: Safety check: Does this user own this order?
-                        // if (fdToUserId[fds[i].fd] != accountMgr.getUserIdByOrderId(req.exchangeId)) {
-                        //     std::cout << "[WARN] User " << fdToUserId[fds[i].fd] << " attempted to cancel order " << req.exchangeId << " which they do not own!" << std::endl;
-                        //     continue;
-                        // }
-
                         engine.cancelOrder(req.exchangeId);
                         dbMgr.updateOrderStatus(req.exchangeId, 0, "CANCELLED");
                     }
