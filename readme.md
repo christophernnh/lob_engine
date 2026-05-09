@@ -19,8 +19,8 @@ Defining Schema
 - Create schema.sql
 - Run "sqlite3 lob.db < schema.sql" to initiate
 - Check schemas:
-    - Run "sqlite3 lob.db"
-    - .tables
-    - .schema Orders
-    - .quit
+  - Run "sqlite3 lob.db"
+  - .tables
+  - .schema Orders
+  - .quit
 - Truncate tables: sqlite3 lob.db "DELETE FROM Users; DELETE FROM Holdings; DELETE FROM Orders; DELETE FROM Trades; DELETE FROM sqlite_sequence WHERE name IN ('Users', 'Orders', 'Trades'); VACUUM;"

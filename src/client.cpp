@@ -2,9 +2,10 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
-#include "Protocol.hpp"
 #include <thread>
 #include <mutex>
+#include <vector>
+#include "Protocol.hpp"
 
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
@@ -13,89 +14,82 @@
 
 using namespace ftxui;
 
-// Global state
-// This is updated by your socket listener thread
-static MarketDataSnapshot current_snapshot;
-static std::mutex snapshot_mutex;
+// --- Global State ---
 int sock_fd = -1;
 int logged_in_user_id = -1;
-enum class AppState
-{
-    LOGIN,
-    TRADING
-};
-AppState current_state = AppState::LOGIN;
+int selected_tab = 0; // Use a dedicated int for the Tab component
+
+std::string global_login_msg = "Please log in";
+bool login_in_progress = false;
+
+std::mutex snapshot_mutex;
+MarketDataSnapshot current_snapshot;
 
 // --- Networking Helpers ---
 
-bool connect_to_engine()
-{
+bool connect_to_engine() {
     sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, "/tmp/engine.sock", sizeof(addr.sun_path) - 1);
 
-    if (connect(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) == -1)
-    {
-        return false;
-    }
-    return true;
+    return (connect(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) != -1);
 }
 
-void socket_listener(ScreenInteractive* screen) {
+void socket_listener(ScreenInteractive *screen) {
     while (true) {
         MsgHeader header;
-        // 1. Read ONLY the header first
-        int n = recv(sock_fd, &header, sizeof(header), MSG_WAITALL); 
-        if (n <= 0) break;
+        // 1. Read header (MSG_WAITALL ensures we get exactly 4/8 bytes)
+        if (recv(sock_fd, &header, sizeof(header), MSG_WAITALL) <= 0) break;
 
-        if (header.type == MsgType::MARKET_DATA) {
-            MarketDataSnapshot snapshot;
-            snapshot.header = header; // Put the header back in
-            
-            // Read the rest (excluding the header we already got)
-            char* ptr = (char*)&snapshot + sizeof(MsgHeader);
+        if (header.type == MsgType::LOGIN_RES) {
+            LoginResponse res;
+            // Note: If your LoginResponse struct DOES NOT contain the header, 
+            // read the rest of it here.
+            if (recv(sock_fd, &res, sizeof(res), MSG_WAITALL) > 0) {
+                if (res.success) {
+                    logged_in_user_id = res.userId;
+                    global_login_msg = "Success!";
+                    selected_tab = 1; // Flip to TRADING screen
+                } else {
+                    global_login_msg = "Login Failed: Invalid Credentials";
+                    login_in_progress = false;
+                }
+                screen->PostEvent(Event::Custom);
+            }
+        } 
+        else if (header.type == MsgType::MARKET_DATA) {
+            MarketDataSnapshot snap;
+            // Since we already read the header, we read the REST of the snapshot struct
+            // This assumes your struct starts with the header.
+            char *ptr = (char *)&snap + sizeof(MsgHeader);
             int remaining = sizeof(MarketDataSnapshot) - sizeof(MsgHeader);
-            
-            int n2 = recv(sock_fd, ptr, remaining, MSG_WAITALL);
-            
-            if (n2 == remaining) {
+
+            if (recv(sock_fd, ptr, remaining, MSG_WAITALL) == remaining) {
                 std::lock_guard<std::mutex> lock(snapshot_mutex);
-                current_snapshot = snapshot;
-                screen->PostEvent(Event::Custom); // Force Redraw
+                current_snapshot = snap;
+                current_snapshot.header = header; // Restore the header we read earlier
+                screen->PostEvent(Event::Custom);
             }
         }
     }
 }
 
-bool attempt_login(const std::string &user, const std::string &pass)
-{
-    // 1. Pack Header + Request
+void attempt_login(const std::string &user, const std::string &pass) {
+    login_in_progress = true;
+    global_login_msg = "Authenticating...";
+
     MsgHeader header = {MsgType::LOGIN_REQ};
     LoginRequest req;
     strncpy(req.username, user.c_str(), 15);
     strncpy(req.password, pass.c_str(), 15);
 
-    // 2. Send to Server
     send(sock_fd, &header, sizeof(header), 0);
     send(sock_fd, &req, sizeof(req), 0);
-
-    // 3. Wait for Response
-    LoginResponse res;
-    if (recv(sock_fd, &res, sizeof(res), 0) > 0)
-    {
-        if (res.success)
-        {
-            logged_in_user_id = res.userId;
-            return true;
-        }
-    }
-    return false;
 }
 
-void send_order(double price, int qty, char side)
-{
+void send_order(double price, int qty, char side) {
     MsgHeader header = {MsgType::ORDER_NEW};
     OrderMsg msg;
     std::string clId = "TUI-" + std::to_string(rand() % 1000);
@@ -110,157 +104,97 @@ void send_order(double price, int qty, char side)
 
 // --- TUI Components ---
 
-Component CreateLoginScreen(std::function<void()> on_success)
-{
+Component CreateLoginScreen() {
     static std::string username = "";
     static std::string password = "";
-    static std::string status_msg = "Please log in";
 
     auto input_user = Input(&username, "Username");
-    auto input_pass = Input(&password, "Password");
-
-    // Mask password
     InputOption pass_opt;
     pass_opt.password = true;
-    auto input_pass_masked = Input(&password, "Password", pass_opt);
+    auto input_pass = Input(&password, "Password", pass_opt);
 
-    auto btn = Button("LOGIN", [&]
-                      {
-        if (attempt_login(username, password)) {
-            on_success();
-        } else {
-            status_msg = "Login Failed!";
-        } });
+    auto btn = Button("LOGIN", [&] {
+        if (!login_in_progress) attempt_login(username, password);
+    }, ButtonOption::Ascii());
 
-    return Renderer(Container::Vertical({input_user, input_pass_masked, btn}), [&, input_user, input_pass_masked, btn]
-                    { return vbox({text("ENGINE LOGIN") | bold | center,
-                                   separator(),
-                                   hbox(text(" User: "), input_user->Render()),
-                                   hbox(text(" Pass: "), input_pass_masked->Render()),
-                                   separator(),
-                                   center(btn->Render()),
-                                   center(text(status_msg) | color(Color::Red))}) |
-                             border | size(WIDTH, LESS_THAN, 40) | center; });
+    return Renderer(Container::Vertical({input_user, input_pass, btn}), [&, input_user, input_pass, btn] {
+        return vbox({
+            text("EXCHANGE LOGIN") | bold | center,
+            separator(),
+            hbox(text(" User: "), input_user->Render()) | border,
+            hbox(text(" Pass: "), input_pass->Render()) | border,
+            separator(),
+            center(btn->Render()),
+            center(text(global_login_msg) | color(login_in_progress ? Color::Yellow : Color::Red))
+        }) | border | size(WIDTH, LESS_THAN, 50) | center;
+    });
 }
 
-Element RenderOrderBook(const MarketDataSnapshot &snapshot)
-{
-    // 1. Define the grid of elements (a vector of vectors)
+Element RenderOrderBook(const MarketDataSnapshot &snapshot) {
     std::vector<std::vector<Element>> data;
+    data.push_back({text("Qty") | bold, text("Bid") | color(Color::Green), text(" "), text("Ask") | color(Color::Red), text("Qty") | bold});
 
-    // 2. Create the Header Row
-    data.push_back({text("Qty") | bold,
-                    text("Bid") | color(Color::Green) | bold,
-                    text(" "),
-                    text("Ask") | color(Color::Red) | bold,
-                    text("Qty") | bold});
-
-    // 3. Add the 10 Price Levels
-    for (int i = 0; i < 10; ++i)
-    {
+    for (int i = 0; i < 10; ++i) {
         bool has_bid = i < snapshot.bidLevels;
         bool has_ask = i < snapshot.askLevels;
-
-        data.push_back({text(has_bid ? std::to_string(snapshot.bids[i].volume) : ""),
-                        text(has_bid ? std::to_string(snapshot.bids[i].price) : "") | color(Color::Green),
-                        text("|") | dim,
-                        text(has_ask ? std::to_string(snapshot.asks[i].price) : "") | color(Color::Red),
-                        text(has_ask ? std::to_string(snapshot.asks[i].volume) : "")});
+        data.push_back({
+            text(has_bid ? std::to_string(snapshot.bids[i].volume) : ""),
+            text(has_bid ? std::to_string(snapshot.bids[i].price) : "") | color(Color::Green),
+            text("|") | dim,
+            text(has_ask ? std::to_string(snapshot.asks[i].price) : "") | color(Color::Red),
+            text(has_ask ? std::to_string(snapshot.asks[i].volume) : "")
+        });
     }
 
-    // 4. Construct the Table from the grid
-    // 4. Construct the Table from the grid
     auto table = Table(data);
-
-    // 5. Apply the styling using the updated API
     table.SelectAll().SeparatorVertical();
-    table.SelectAll().Border(LIGHT);
-
-    // Target the first row (the header) specifically
     table.SelectRow(0).SeparatorHorizontal();
-    table.SelectRow(0).Border(LIGHT); // Double borders on rows can be finicky; LIGHT is safer
-
+    table.SelectAll().Border(LIGHT);
     return table.Render();
 }
 
-Component CreateTradingScreen()
-{
+Component CreateTradingScreen() {
     static std::string price_str = "100.0";
     static std::string qty_str = "10";
 
     auto input_price = Input(&price_str, "Price");
-    auto input_qty = Input(&qty_str, "Quantity");
+    auto input_qty = Input(&qty_str, "Qty");
+    auto btn_buy = Button("BUY", [&]{ send_order(std::stod(price_str), std::stoi(qty_str), 'B'); }, ButtonOption::Ascii());
+    auto btn_sell = Button("SELL", [&]{ send_order(std::stod(price_str), std::stoi(qty_str), 'S'); }, ButtonOption::Ascii());
 
-    auto btn_buy = Button("BUY (BID)", [&]
-                          { send_order(std::stod(price_str), std::stoi(qty_str), 'B'); }, ButtonOption::Ascii());
-
-    auto btn_sell = Button("SELL (ASK)", [&]
-                           { send_order(std::stod(price_str), std::stoi(qty_str), 'S'); }, ButtonOption::Ascii());
-
-    // Group the inputs and buttons into a container for navigation
-    auto container = Container::Vertical({
-        input_price,
-        input_qty,
-        btn_buy,
-        btn_sell,
-    });
-
-    return Renderer(container, [&, input_price, input_qty, btn_buy, btn_sell]
-                    {
-        // Left Side: The Market Data
-        auto market_data_panel = vbox({
-            text(" MARKET DEPTH ") | bold | center,
-            Renderer([&] {
-                MarketDataSnapshot local_copy;
-                {
-                    std::lock_guard<std::mutex> lock(snapshot_mutex);
-                    local_copy = current_snapshot;
-                }
-                return RenderOrderBook(local_copy);
-            })->Render()
-        }) | flex;
-
-        // Right Side: Your existing Order Entry form
-        auto order_entry_panel = vbox({
+    return Renderer(Container::Vertical({input_price, input_qty, btn_buy, btn_sell}), [&, input_price, input_qty, btn_buy, btn_sell] {
+        auto book_panel = vbox({ text(" MARKET DEPTH ") | bold | center, RenderOrderBook(current_snapshot) }) | flex;
+        auto order_panel = vbox({
             text(" ORDER ENTRY ") | bold | center,
             separator(),
             hbox(text(" Price: "), input_price->Render()) | border,
             hbox(text(" Qty:   "), input_qty->Render()) | border,
-            separator(),
-            hbox(btn_buy->Render() | flex | color(Color::Green), 
-                 btn_sell->Render() | flex | color(Color::Red)),
-        }) | size(WIDTH, GREATER_THAN, 30);
+            hbox(btn_buy->Render() | flex | color(Color::Green), btn_sell->Render() | flex | color(Color::Red))
+        }) | size(WIDTH, GREATER_THAN, 35);
 
-        // Combine them side-by-side
-        return hbox({
-            market_data_panel,
-            separator(),
-            order_entry_panel
-        }) | borderDouble | center; });
+        return hbox({ book_panel, separator(), order_panel }) | borderDouble;
+    });
 }
 
-int main()
-{
-    if (!connect_to_engine())
-    {
-        std::cerr << "Error: Could not connect to /tmp/engine.sock. Is the server running?" << std::endl;
-        return 1;
-    }
+int main() {
+    if (!connect_to_engine()) return 1;
 
     auto screen = ScreenInteractive::TerminalOutput();
+    
+    // Start listener thread immediately
+    std::thread([&] { socket_listener(&screen); }).detach();
 
-    std::thread listener([&]
-                         { socket_listener(&screen); });
-    listener.detach();
+    auto login_view = CreateLoginScreen();
+    auto trading_view = CreateTradingScreen();
 
-    // State-based component switching
-    Component login_view = CreateLoginScreen([&]
-                                             { current_state = AppState::TRADING; });
-    Component trading_view = CreateTradingScreen();
+    // Use the dedicated 'selected_tab' int
+    auto main_tabs = Container::Tab({login_view, trading_view}, &selected_tab);
 
-    auto main_container = Container::Tab({login_view, trading_view}, (int *)&current_state);
+    // Main Renderer that forces a refresh of the Tab container
+    auto main_renderer = Renderer(main_tabs, [&] {
+        return main_tabs->Render();
+    });
 
-    screen.Loop(main_container);
-
+    screen.Loop(main_renderer);
     return 0;
 }

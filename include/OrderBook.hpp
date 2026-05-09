@@ -24,4 +24,11 @@ public:
 
     MatchResult matchOrder(Order &incomingOrder);
     uint64_t generateExchangeId();
+
+    void rehydrate(const std::vector<Order>& activeOrders);
+    
+    void setNextExchangeId(uint64_t nextId) {
+        nextExchangeId.store(nextId, std::memory_order_relaxed);
+    }
+
 };

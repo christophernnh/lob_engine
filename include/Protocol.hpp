@@ -1,6 +1,6 @@
 #pragma once
 #include <cstdint>
-
+#pragma pack(push, 1)
 enum class MsgType : char
 {
     LOGIN_REQ = 'L',
@@ -11,7 +11,6 @@ enum class MsgType : char
     MARKET_DATA = 'M'
 };
 
-#pragma pack(push, 1)
 struct MsgHeader
 {
     MsgType type;
@@ -68,12 +67,14 @@ struct MatchResult
     bool wasAddedToBook;
 };
 
-struct PriceLevel {
+struct PriceLevel
+{
     double price;
     int volume;
 };
 
-struct MarketDataSnapshot {
+struct MarketDataSnapshot
+{
     MsgHeader header; // Type: MARKET_DATA
     PriceLevel bids[10];
     PriceLevel asks[10];

@@ -6,6 +6,7 @@
 #include <mutex>
 #include <condition_variable>
 #include "Protocol.hpp" // Access to structs like OrderMsg and OrderResponse
+#include "Order.hpp"
 
 enum class DBTaskType
 {
@@ -20,6 +21,7 @@ struct DBTask
     DBTaskType type;
     // For Orders
     std::string exchangeId;
+    std::string clOrdId;
     int userId;
     double price;
     int qty;
@@ -60,7 +62,12 @@ public:
     ~DatabaseManager();
     AuthData getUserAuthData(const std::string &username);
 
-    void enqueueOrder(uint64_t exId, int userId, double price, int qty, std::string side, std::string status);
+    uint64_t getMaxExchangeId();
+    void enqueueOrder(uint64_t exId, std::string clOrdId, int userId, double price, int qty, std::string side, std::string status);
     void enqueueTrade(uint64_t takerId, uint64_t makerId, double price, int qty);
     void updateOrderStatus(uint64_t exId, int remainingQty, std::string status);
+
+
+    // Rehydration methods for server startup
+    std::vector<Order> getActiveOrders();
 };

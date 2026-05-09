@@ -6,12 +6,36 @@ DatabaseManager::DatabaseManager(const std::string &dbPath)
     sqlite3_open(dbPath.c_str(), &db);
 
     // Prepare ALL statements once at startup
-    sqlite3_prepare_v2(db, "INSERT INTO Orders (exchange_id, user_id, side, price, qty, status) VALUES (?, ?, ?, ?, ?, ?);", -1, &insertOrderStmt, nullptr);
+    sqlite3_prepare_v2(db, "INSERT INTO Orders (exchange_id, cl_ord_id, user_id, side, price, qty, status) VALUES (?, ?, ?, ?, ?, ?, ?);", -1, &insertOrderStmt, nullptr);
     sqlite3_prepare_v2(db, "INSERT INTO Trades (maker_order_id, taker_order_id, price, qty) VALUES (?, ?, ?, ?);", -1, &insertTradeStmt, nullptr);
     sqlite3_prepare_v2(db, "UPDATE Orders SET qty = ?, status = ? WHERE exchange_id = ?;", -1, &updateOrderStmt, nullptr);
     sqlite3_prepare_v2(db, "INSERT INTO Holdings (user_id, quantity) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET quantity = quantity + excluded.quantity;", -1, &updateHoldingStmt, nullptr);
 
     workerThread = std::thread(&DatabaseManager::run, this);
+
+    // WAL mode for better concurrency, and NORMAL sync for performance (since we're using a background thread)
+    sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", nullptr, nullptr, nullptr);
+}
+
+uint64_t DatabaseManager::getMaxExchangeId()
+{
+    const char *sql = "SELECT MAX(CAST(exchange_id AS INTEGER)) FROM Orders;";
+    sqlite3_stmt *stmt;
+    uint64_t maxId = 1000;
+
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK)
+    {
+        if (sqlite3_step(stmt) == SQLITE_ROW)
+        {
+            // sqlite3_column_int64 returns 0 if the table is empty or NULL
+            uint64_t result = sqlite3_column_int64(stmt, 0);
+            if (result > 0)
+                maxId = result;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return maxId;
 }
 
 void DatabaseManager::run()
@@ -33,15 +57,23 @@ void DatabaseManager::run()
         // Execute Orders and Trades
         if (task.type == DBTaskType::INSERT_ORDER)
         {
+            // 1: exchange_id
             sqlite3_bind_text(insertOrderStmt, 1, task.exchangeId.c_str(), -1, SQLITE_STATIC);
-            sqlite3_bind_int(insertOrderStmt, 2, task.userId);
-            sqlite3_bind_text(insertOrderStmt, 3, task.side.c_str(), -1, SQLITE_STATIC);
-            sqlite3_bind_double(insertOrderStmt, 4, task.price);
-            sqlite3_bind_int(insertOrderStmt, 5, task.qty);
+            // 2: cl_ord_id
+            sqlite3_bind_text(insertOrderStmt, 2, task.clOrdId.c_str(), -1, SQLITE_STATIC);
+            // 3: user_id
+            sqlite3_bind_int(insertOrderStmt, 3, task.userId);
+            // 4: side
+            sqlite3_bind_text(insertOrderStmt, 4, task.side.c_str(), -1, SQLITE_STATIC);
+            // 5: price
+            sqlite3_bind_double(insertOrderStmt, 5, task.price);
+            // 6: qty
+            sqlite3_bind_int(insertOrderStmt, 6, task.qty);
+            // 7: status
+            sqlite3_bind_text(insertOrderStmt, 7, task.status.c_str(), -1, SQLITE_STATIC);
 
             sqlite3_step(insertOrderStmt);
             sqlite3_reset(insertOrderStmt);
-            sqlite3_clear_bindings(insertOrderStmt);
         }
         else if (task.type == DBTaskType::INSERT_TRADE)
         {
@@ -52,7 +84,6 @@ void DatabaseManager::run()
 
             sqlite3_step(insertTradeStmt);
             sqlite3_reset(insertTradeStmt);
-            sqlite3_clear_bindings(insertTradeStmt);
         }
         else if (task.type == DBTaskType::UPDATE_ORDER_STATUS)
         {
@@ -62,17 +93,17 @@ void DatabaseManager::run()
 
             sqlite3_step(updateOrderStmt);
             sqlite3_reset(updateOrderStmt);
-            sqlite3_clear_bindings(updateOrderStmt);
         }
     }
 }
 
-void DatabaseManager::enqueueOrder(uint64_t exId, int userId, double price, int qty, std::string side, std::string status)
+void DatabaseManager::enqueueOrder(uint64_t exId, std::string clOrdId, int userId, double price, int qty, std::string side, std::string status)
 {
     {
         std::lock_guard<std::mutex> lock(queueMutex);
         taskQueue.push({DBTaskType::INSERT_ORDER,
                         std::to_string(exId),
+                        clOrdId,
                         userId,
                         price,
                         qty,
@@ -88,7 +119,7 @@ void DatabaseManager::enqueueTrade(uint64_t makerId, uint64_t takerId, double pr
     {
         std::lock_guard<std::mutex> lock(queueMutex);
         taskQueue.push({DBTaskType::INSERT_TRADE,
-                        "", 0, price, qty, "", "", // Empty Order fields
+                        "", "", 0, price, qty, "", "", // Empty Order fields
                         std::to_string(takerId),
                         std::to_string(makerId)});
     }
@@ -141,4 +172,70 @@ AuthData DatabaseManager::getUserAuthData(const std::string &username)
 
     sqlite3_finalize(stmt);
     return result;
+}
+
+std::vector<Order> DatabaseManager::getActiveOrders()
+{
+    std::vector<Order> orders;
+    // We select 7 columns total: 0 to 6
+    const char *sql = "SELECT exchange_id, user_id, side, price, qty, cl_ord_id, status "
+                      "FROM Orders "
+                      "WHERE status IN ('OPEN', 'PARTIAL') AND qty > 0;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK)
+    {
+        std::cerr << "[DB] Failed to prepare rehydration query: " << sqlite3_errmsg(db) << std::endl;
+        return orders;
+    }
+
+    while (sqlite3_step(stmt) == SQLITE_ROW)
+    {
+        // 1. Capture raw pointers carefully
+        const char *raw_ex_id = (const char *)sqlite3_column_text(stmt, 0);
+        const char *raw_side = (const char *)sqlite3_column_text(stmt, 2);
+        const char *raw_cl_id = (const char *)sqlite3_column_text(stmt, 5);
+        const char *raw_status = (const char *)sqlite3_column_text(stmt, 6);
+
+        // 2. CRITICAL: Null Check before processing
+        if (!raw_ex_id || !raw_side || !raw_cl_id)
+        {
+            std::cerr << "[WARN] Skipping incomplete row in Orders table." << std::endl;
+            continue;
+        }
+
+        try
+        {
+            Order order;
+            // Use the captured pointers directly to avoid extra SQLite overhead
+            order.exchangeId = std::stoull(raw_ex_id);
+            order.userId = sqlite3_column_int(stmt, 1);
+
+            // Efficient string comparison for Side
+            order.side = (std::string(raw_side) == "BUY") ? Side::BUY : Side::SELL;
+
+            order.price = sqlite3_column_double(stmt, 3);
+            order.qty = sqlite3_column_int(stmt, 4);
+
+            // Safe copy to fixed-size char array
+            // This is the cleanest way if using std::string in the struct
+            if (raw_cl_id)
+            {
+                order.clOrdId = raw_cl_id;
+            }
+
+            // Safe assignment for status (std::string)
+            order.status = raw_status ? raw_status : "OPEN";
+
+            orders.push_back(order);
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "[ERROR] Data conversion failed for order " << (raw_ex_id ? raw_ex_id : "unknown")
+                      << ": " << e.what() << std::endl;
+        }
+    }
+
+    sqlite3_finalize(stmt);
+    return orders;
 }

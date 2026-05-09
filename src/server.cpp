@@ -8,7 +8,7 @@
 #include "Protocol.hpp"
 #include "DatabaseManager.hpp" // For async DB logging
 #include "AccountManager.hpp"  // For async DB logging
-#include "NetworkUtils.hpp"   // For snapshot sending helpers
+#include "NetworkUtils.hpp"    // For snapshot sending helpers
 
 #define SOCKET_PATH "/tmp/engine.sock" // Address of server in local PC
 #define BUFFER_SIZE 1024               // Max size of a single message
@@ -49,6 +49,21 @@ int main()
     DatabaseManager dbMgr("lob.db");
     AccountManager accountMgr(dbMgr);
     std::unordered_map<int, int> fdToUserId;
+
+    // 1. Rehydrate the maps with OPEN orders
+    std::cout << "[SERVER] Rehydrating Order Book..." << std::endl;
+    auto savedOrders = dbMgr.getActiveOrders();
+    for (const auto &ord : savedOrders)
+    {
+        engine.processOrder(ord);
+    }
+
+    // 2. Synchronize the ID counter with the Database
+    uint64_t lastUsedId = dbMgr.getMaxExchangeId();
+    engine.setNextExchangeId(lastUsedId + 1);
+
+    std::cout << "[SERVER] System Ready. Next Exchange ID: " << lastUsedId + 1 << std::endl;
+    std::cout << "[SERVER] Active Orders Loaded: " << savedOrders.size() << std::endl;
 
     // Main loop
     while (true)
@@ -100,12 +115,22 @@ int main()
                         LoginRequest *req = reinterpret_cast<LoginRequest *>(login_buf + sizeof(MsgHeader));
                         int uid = accountMgr.authenticate(req->username, req->password);
 
+                        // 1. Prepare Header
+                        MsgHeader resHeader = {MsgType::LOGIN_RES};
+                        // 2. Prepare Payload
                         LoginResponse res = {(uid != -1), uid};
+
+                        // 3. Send BOTH (Header first, then Payload)
+                        send(fds[i].fd, &resHeader, sizeof(MsgHeader), 0);
                         send(fds[i].fd, &res, sizeof(LoginResponse), 0);
 
                         if (uid != -1)
+                        {
                             fdToUserId[fds[i].fd] = uid;
-                            NetworkUtils::broadcastSnapshot(fds, server_fd, engine);
+                            // 4. Send the initial snapshot ONLY to this user (Unicast)
+                            // This ensures they see the book immediately upon login.
+                            NetworkUtils::sendSnapshotToClient(fds[i].fd, engine);
+                        }
                     }
                     else if (type == MsgType::ORDER_NEW)
                     {
@@ -131,29 +156,21 @@ int main()
                             uint64_t exID = engine.generateExchangeId();
 
                             Order incoming = {
-                                clientID,
                                 exID,
+                                clientID,
+                                fdToUserId[fds[i].fd],
+                                (msg->side == 'B' ? Side::BUY : Side::SELL),
                                 msg->price,
                                 msg->qty,
-                                (msg->side == 'B' ? Side::BUY : Side::SELL)};
+                                "OPEN"};
 
                             MatchResult result = engine.matchOrder(incoming);
-                            
-                            NetworkUtils::broadcastSnapshot(fds, server_fd, engine);
 
-                            // MarketDataSnapshot snapshot = engine.getL2Snapshot();
-                            // for (size_t j = 0; j < fds.size(); ++j) {
-                            //     if (fds[j].fd != server_fd) { // Don't send to the listening socket
-                            //         int sent_bytes = send(fds[j].fd, &snapshot, sizeof(snapshot), 0);
-                            //         if (sent_bytes < 0) {
-                            //             perror("Send failed");
-                            //         }
-                            //     }
-                            // }
+                            NetworkUtils::broadcastSnapshot(fds, server_fd, engine);
 
                             // Async DB logging
                             std::string status = result.isFullyFilled ? "FILLED" : (result.trades.empty() ? "OPEN" : "PARTIAL");
-                            dbMgr.enqueueOrder(incoming.exchangeId, fdToUserId[fds[i].fd], incoming.price, incoming.qty, incoming.side == Side::BUY ? "BUY" : "SELL", status);
+                            dbMgr.enqueueOrder(incoming.exchangeId, incoming.clOrdId, fdToUserId[fds[i].fd], incoming.price, incoming.qty, incoming.side == Side::BUY ? "BUY" : "SELL", status);
 
                             for (const auto &t : result.trades)
                             {
@@ -170,10 +187,14 @@ int main()
                             }
 
                             // ... Send ACK ...
+                            MsgHeader ackHeader = {MsgType::ORDER_ACK}; // Ensure this exists in your Enum!
                             OrderResponse res;
                             memcpy(res.clOrdId, msg->clOrdId, 16);
                             res.exchangeId = exID;
-                            res.status = 'A';
+                            res.status = 'A'; // A for Accepted
+
+                            // Send Header then Payload
+                            send(fds[i].fd, &ackHeader, sizeof(MsgHeader), 0);
                             send(fds[i].fd, &res, sizeof(OrderResponse), 0);
                         }
                     }

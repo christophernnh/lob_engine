@@ -179,3 +179,16 @@ uint64_t OrderBook::generateExchangeId()
 {
     return nextExchangeId.fetch_add(1, std::memory_order_relaxed);
 }
+
+void OrderBook::rehydrate(const std::vector<Order>& activeOrders)
+{
+    uint64_t maxId = 1000;
+    for (const auto& order : activeOrders)
+    {
+        processOrder(order);
+        if (order.exchangeId > maxId)
+            maxId = order.exchangeId;
+    }
+    nextExchangeId.store(maxId + 1, std::memory_order_relaxed);
+    std::cout << "Rehydrated " << activeOrders.size() << " orders. Next Exchange ID: " << nextExchangeId.load() << std::endl;
+}
